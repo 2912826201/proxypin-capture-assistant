@@ -11,3 +11,13 @@ requests.json
 capture/
 images/
 bootstrap-report.json
+capture-session.json
+capture-session.lock
+setup-state.json
+emulator-state.json
+emulator-config.json
+paths.json
+private/
+capture-runs/
+sample/
+final/

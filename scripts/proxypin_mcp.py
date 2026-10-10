@@ -13,14 +13,17 @@ import ipaddress
 import json
 import os
 import sys
+import tempfile
 import warnings
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 DEFAULT_ENDPOINT = os.environ.get("PROXYPIN_MCP_ENDPOINT", "http://127.0.0.1:9127/mcp")
+DEFAULT_BODY_CHUNK_LIMIT = 65536
 
 
 class MCPError(RuntimeError):
@@ -82,6 +85,13 @@ def _flow_time_ms(value: Any) -> int:
         return int(parsed.timestamp() * 1000)
     except (ValueError, TypeError, OverflowError) as exc:
         raise MCPError("Captured flow has an invalid timestamp.") from exc
+
+
+def body_chunk_limit(client: Any) -> int:
+    """Share the discovered byte limit, retaining compatibility with simple fakes."""
+    reader = getattr(client, "body_chunk_limit", None)
+    maximum = reader() if callable(reader) else DEFAULT_BODY_CHUNK_LIMIT
+    return min(maximum, DEFAULT_BODY_CHUNK_LIMIT) if type(maximum) is int and maximum > 0 else DEFAULT_BODY_CHUNK_LIMIT
 
 
 class ProxyPinMCP:
@@ -236,30 +246,49 @@ class ProxyPinMCP:
         except ValueError as exc:
             raise MCPError("ProxyPin tool returned invalid JSON content.") from exc
 
+    def body_chunk_limit(self) -> int:
+        """Honor the discovered get_flow_body schema, within the local byte cap."""
+        self.require_tools(["get_flow_body"])
+        metadata: Any = (self._tools or {}).get("get_flow_body")
+        for key in ("inputSchema", "properties", "limit", "maximum"):
+            if not isinstance(metadata, dict):
+                return DEFAULT_BODY_CHUNK_LIMIT
+            metadata = metadata.get(key)
+        return min(metadata, DEFAULT_BODY_CHUNK_LIMIT) if type(metadata) is int and metadata > 0 else DEFAULT_BODY_CHUNK_LIMIT
+
     def read_flow_text(self, flow_id: str, history_id: str | None = None) -> str:
         chunks: list[str] = []
         offset, expected_total = 0, None
+        chunk_limit = body_chunk_limit(self)
         while True:
-            arguments = {"id": flow_id, "side": "response", "offset": offset, "limit": 65536}
-            if history_id:
-                arguments["history_id"] = history_id
-            part = self.call("get_flow_body", arguments)
-            if not isinstance(part, dict):
-                raise MCPError("get_flow_body returned an invalid schema.")
-            if not part.get("available") or part.get("binary"):
-                raise MCPError("Captured response is unavailable or binary; MCP does not return image bytes.")
-            returned = _integer(part.get("returned"), "body returned")
-            total = _integer(part.get("total"), "body total")
-            actual_offset = _integer(part.get("offset"), "body offset")
-            text = part.get("text")
-            if total > self.max_body_bytes or total < 0:
-                raise MCPError("Captured text response exceeded its configured size limit.")
-            if expected_total is None:
-                expected_total = total
-            if total != expected_total or actual_offset != offset or returned < 0 or returned > 65536 or offset + returned > total:
-                raise MCPError("Captured body pagination is inconsistent.")
-            if not isinstance(text, str) or len(text.encode("utf-8")) != returned:
-                raise MCPError("Captured UTF-8 body slice is incomplete or splits a multibyte character; refusing corrupted text.")
+            # ProxyPin slices bytes before decoding. A maximum slice can end inside
+            # a UTF-8 character; retry at most three shorter slices at the same offset.
+            for adjustment in range(min(4, chunk_limit)):
+                limit = chunk_limit - adjustment
+                arguments = {"id": flow_id, "side": "response", "offset": offset, "limit": limit}
+                if history_id:
+                    arguments["history_id"] = history_id
+                part = self.call("get_flow_body", arguments)
+                if not isinstance(part, dict):
+                    raise MCPError("get_flow_body returned an invalid schema.")
+                if not part.get("available") or part.get("binary"):
+                    raise MCPError("Captured response is unavailable or binary; MCP does not return image bytes.")
+                returned = _integer(part.get("returned"), "body returned")
+                total = _integer(part.get("total"), "body total")
+                actual_offset = _integer(part.get("offset"), "body offset")
+                text = part.get("text")
+                if total > self.max_body_bytes or total < 0:
+                    raise MCPError("Captured text response exceeded its configured size limit.")
+                if expected_total is None:
+                    expected_total = total
+                if total != expected_total or actual_offset != offset or returned < 0 or returned > limit or offset + returned > total:
+                    raise MCPError("Captured body pagination is inconsistent.")
+                if not isinstance(text, str):
+                    raise MCPError("Captured text body is missing.")
+                if len(text.encode("utf-8")) == returned and not (text.endswith("\ufffd") and offset + returned < total):
+                    break
+            else:
+                raise MCPError("Captured UTF-8 byte slices could not be reconstructed safely.")
             chunks.append(text)
             offset += returned
             if part.get("truncated") is not (offset < total):
@@ -270,27 +299,109 @@ class ProxyPinMCP:
                 raise MCPError("Captured body pagination made no progress.")
 
 
+def _write_output(path: Path, text: str, overwrite: bool = False) -> int:
+    """Publish a complete UTF-8 file, keeping an existing destination by default."""
+    data = text.encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".proxypin-", suffix=".tmp", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Linking the complete temporary file atomically refuses a concurrent
+            # destination too; a preflight exists() check alone would race.
+            os.link(temporary, path)
+        return len(data)
+    except FileExistsError as exc:
+        raise MCPError("Output file already exists; choose another path or use --overwrite.") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _safe_json(value: Any, client: ProxyPinMCP) -> Any:
+    """Redact token-bearing strings before JSON escaping can hide the token."""
+    if isinstance(value, str):
+        return client.safe_text(value)
+    if isinstance(value, list):
+        return [_safe_json(item, client) for item in value]
+    if isinstance(value, dict):
+        return {client.safe_text(key) if isinstance(key, str) else key: _safe_json(item, client)
+                for key, item in value.items()}
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--timeout", type=float, default=45)
     parser.add_argument("--no-token", action="store_true", help="Only for a trusted desktop server without authentication")
     parser.add_argument("--require-token", action="store_true", help="Require mobile Bearer authentication even through loopback USB forwarding")
-    parser.add_argument("--tool", help="Call a discovered MCP tool; omit to list tool metadata")
-    parser.add_argument("--arguments", default="{}", help="JSON tool arguments, never the MCP Bearer token")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--tool", help="Call a discovered MCP tool; omit to list tool metadata")
+    operation.add_argument("--body-flow-id", help="Actual captured flow ID; fetch its complete response text with validated pagination")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--arguments", help="JSON object tool arguments, never the MCP Bearer token")
+    inputs.add_argument("--arguments-file", type=Path, help="Read a UTF-8 JSON object instead of quoting --arguments in the shell")
+    parser.add_argument("--output", type=Path, help="Save token-redacted tool result or tool metadata JSON; stdout contains only path and counts")
+    parser.add_argument("--body-output", type=Path, help="Save complete response UTF-8 text locally; keep this private file out of the Skill and Git")
+    parser.add_argument("--history-id", help="Actual history ID for --body-flow-id, if the flow is in a saved capture")
+    parser.add_argument("--overwrite", action="store_true", help="Explicitly permit replacement of an existing output file")
     args = parser.parse_args(argv)
+    if args.body_flow_id is not None:
+        if not args.body_flow_id.strip() or len(args.body_flow_id) > 256 or any(char in args.body_flow_id for char in "\r\n"):
+            parser.error("--body-flow-id must be an actual compact captured flow ID")
+        if args.body_output is None:
+            parser.error("--body-flow-id requires --body-output")
+        if args.output is not None or args.arguments is not None or args.arguments_file is not None:
+            parser.error("--body-flow-id uses --body-output and cannot use --output or tool arguments")
+    elif args.body_output is not None or args.history_id is not None:
+        parser.error("--body-output and --history-id require --body-flow-id")
     client = None
     try:
-        client = ProxyPinMCP(args.endpoint, read_token(args.no_token, args.endpoint, args.require_token), args.timeout)
-        tools = client.discover()
-        arguments = json.loads(args.arguments)
+        arguments_text = (args.arguments_file.read_text(encoding="utf-8-sig") if args.arguments_file
+                          else args.arguments if args.arguments is not None else "{}")
+        arguments = json.loads(arguments_text)
         if not isinstance(arguments, dict):
             raise MCPError("Tool arguments must be a JSON object.")
+        output = args.body_output if args.body_flow_id is not None else args.output
+        if output is not None:
+            output = output.resolve()
+            skill_root = Path(__file__).resolve().parent.parent
+            if output.is_relative_to(skill_root):
+                raise MCPError("Output must be outside this Skill/repository; choose a private capture work directory.")
+            if output.exists() and not args.overwrite:
+                raise MCPError("Output file already exists; choose another path or use --overwrite.")
+        client = ProxyPinMCP(args.endpoint, read_token(args.no_token, args.endpoint, args.require_token), args.timeout)
+        tools = client.discover()
+        if args.body_flow_id is not None:
+            body = client.read_flow_text(args.body_flow_id, args.history_id)
+            size = _write_output(output, body, args.overwrite)
+            summary = {"output": str(output.resolve()), "format": "text", "bytes": size, "mcp_rpc_calls": client.rpc_calls}
+            print(json.dumps(_safe_json(summary, client), ensure_ascii=False))
+            return 0
         result = client.call(args.tool, arguments) if args.tool else {"tools": list(tools.values())}
-        print(client.safe_text(json.dumps(result, ensure_ascii=False, indent=2)))
+        serialized = json.dumps(_safe_json(result, client), ensure_ascii=False, indent=2)
+        if output is not None:
+            size = _write_output(output, serialized + "\n", args.overwrite)
+            summary = {"output": str(output.resolve()), "format": "json", "bytes": size, "mcp_rpc_calls": client.rpc_calls}
+            if args.tool is None:
+                summary["tools"] = len(tools)
+            print(json.dumps(_safe_json(summary, client), ensure_ascii=False))
+        else:
+            print(serialized)
         return 0
-    except (MCPError, ValueError) as exc:
-        print(client.safe_text(exc) if client else str(exc), file=sys.stderr)
+    except (MCPError, ValueError, OSError) as exc:
+        # JSON decode errors and local filenames can contain private input. Before
+        # constructing a client, use a fixed diagnostic rather than reflecting it.
+        message = client.safe_text(exc) if client else "Invalid local arguments or output file; no MCP result was written."
+        if client is None and isinstance(exc, MCPError):
+            message = str(exc)
+        print(message, file=sys.stderr)
         return 2
 
 

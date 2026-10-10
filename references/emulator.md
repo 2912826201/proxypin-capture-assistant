@@ -4,6 +4,8 @@
 
 按需读：设备选择 → 工具与镜像 → 实例启动 → VPN/MCP → 必要的系统 CA → 业务验收 → 恢复与清理。当前官方工具的版本、帮助和实际执行结果优先于示例。
 
+在 [全链路规程](runbook.md) 的route_device阶段使用 `scripts/prepare_emulator.py`，按 [配置与命令配方](command-recipes.md#模拟器准备) 执行check/discover/选择实测镜像与profile/prepare/start/verify。镜像/profile未知先为null；discover准备管理工具并返回实际候选，不创建AVD，解决空白环境先有工具才能发现配置的顺序。helper处理官方受控归档、工具/镜像及任务专用AVD，保留共享组件；许可与实际宿主确认由agent先尝试处理。start只报告进程启动，verify检查设备身份/开机/API/ABI；网络、App、VPN、MCP、系统CA和业务结果仍分别验收。
+
 ## 设备选择与兼容性
 
 - 已有可用会话/HAR 或抓取路线时继续使用。用户指定真实手机、需要其现有登录会话、摄像头/蓝牙等硬件或设备完整性时使用真机，不迁移其账户数据。
@@ -55,7 +57,7 @@
 
 创建时按实际提示回答硬件配置问题，不盲目向所有提示输入 yes。启动端口使用当前帮助允许范围的空闲偶数 console port，连同相邻 ADB port 一起检查；记录预期 `emulator-<port>`。Windows 后台进程使用 `Start-Process -WindowStyle Hidden` 并保存 PID/日志；能用 ADB 操作就不要求用户打开窗口，必要时显示对应模拟器界面。图形异常再按当前 help 使用支持的 software 模式，不沿用已弃用参数。
 
-初次启动禁用快照以得到可复现状态。**仅需要系统 CA、且镜像支持时**追加 `-writable-system`，必要时停止本任务实例后以该选项重新启动。此选项的临时系统副本退出时销毁，不能保证 CA 随重启保留。快照兼容性取决于镜像/AVD/工具版本，也不能代替复核。
+初次启动禁用快照以得到可复现状态。**仅需要系统 CA、且镜像支持时**使用 `-writable-system`：采用helper时先action stop，将配置writable_system设true，再start/verify，由helper记录实际参数与serial；上面的手工命令仅是工具参数说明，不能另启未登记实例。此选项的临时系统副本退出时销毁，不能保证 CA 随重启保留。快照兼容性取决于镜像/AVD/工具版本，也不能代替复核。
 
 ```text
 <adb> devices -l

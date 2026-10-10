@@ -6,11 +6,11 @@
 
 当前助手须已有可执行命令/操作设备的工具以及所需文件权限。Skill 能指导和运行准备工作，但不能凭空赋予宿主未提供的手机控制权限。先检测系统、CPU 架构、当前工具和设备，不假定空白电脑装了 Python、ADB、Android Studio、Git 或 Flutter。
 
-Android 在安装前按 [连接流程](workflow.md) 选真机或模拟器。采用模拟器时同时读 [隔离模拟器路线](emulator.md)：额外准备当前兼容的 SDK 管理工具、Java、模拟器和系统镜像，建立任务专用 AVD；不发真机接线/USB 授权提示。现有 Windows helper 负责 Platform-Tools、ProxyPin、目标 APK 与 Python，**不安装模拟器、完整 SDK 或 AVD**；额外组件由 agent 按该参考执行，不能把 helper 成功当成模拟器已就绪。
+按 [全链路规程](runbook.md) 先验宿主能力，再执行host_tools/route_device。Android 在安装前选真机或模拟器。采用模拟器时用 `scripts/prepare_emulator.py` 和 [命令配方](command-recipes.md#模拟器准备) 准备SDK管理工具、Java、模拟器、镜像及任务专用AVD；不发真机接线/USB授权提示。现有Windows bootstrap helper不包含这些组件；两个helper均须分阶段验收，不能把准备成功当作业务抓包成功。
 
 记录 `setup-state.json`：每项组件的来源、版本、路径、状态、安装验证、待处理动作及恢复项目。状态区分 `missing / prepared / installed / verified / pending_user / blocked`；下载到文件不等于安装成功，安装成功不等于手机可控制或 MCP 可抓流量。不在报告中存密码、token、账号或设备内容。
 
-1. 查宿主自带运行时；有依赖发现工具时先用它。验证 Python 3.10+ 能导入 `ssl/json/urllib/concurrent.futures`。可复用时不重复安装或改全局 PATH。
+1. 查宿主自带运行时；有依赖发现工具时先用它。验证 Python 3.10+ 能导入 `ssl/json/urllib/concurrent.futures`，并用该实际解释器运行本次所需脚本 `--help`；便携/隔离Python也须通过。可复用时不重复安装或改全局PATH。
 2. 需 Android 接管但没有设备控制 MCP / ADB 时，准备官方 SDK Platform-Tools。无需为了 ADB 安装完整 Android Studio、Java、Gradle 或 Flutter。先用官方工具目录的绝对路径运行，避免改用户全局环境。
 3. 查已连接设备和用户目标 App。缺少设备/目标名称且无法推断时只补问缺项，不要求用户选技术方案。
 
@@ -19,6 +19,8 @@ ADB 未识别手机时，agent 检查连接、USB 模式和设备驱动；Window
 ## Windows
 
 可使用 `scripts/bootstrap_windows.ps1`，它自身不依赖 Python。先本地探测，再由 agent 根据实际缺项以 `-Install` 执行所需组件。参数由 agent 填写，不让用户编辑代码。
+
+每次显式传 `-ToolsRoot <任务工作目录中的tools>`，不使用落在Skill内的默认工具目录。读取JSON的`status/probed/installed/pending`；helper最终可退出0却仍有pending，不能以shell退出码判完成。只有选定设备后才执行移动安装并传`-DeviceSerial`。完整命令顺序见 [命令配方](command-recipes.md#解释器与初始化)。
 
 - `-AndroidTools`：下载 Google 官方 Windows Platform-Tools，解压到受控工具目录并验证 ADB。
 - `-ProxyPinDesktop`：从 `wanghongenpin/proxypin` 当前正式发布元数据选择匹配 Windows/架构的发布资产，安装或解压。

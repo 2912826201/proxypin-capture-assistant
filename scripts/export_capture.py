@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from proxypin_mcp import DEFAULT_ENDPOINT, MCPError, ProxyPinMCP, read_token, _flow_time_ms
+# Embeddable/isolated Python does not automatically expose sibling scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from proxypin_mcp import DEFAULT_ENDPOINT, MCPError, ProxyPinMCP, read_token, _flow_time_ms, body_chunk_limit
 
 SENSITIVE = re.compile(r"(^|[_-])(authorization|cookie|token|secret|password|passwd|credential|session|api[_-]?key|signature|sign|device[_-]?id|android[_-]?id|imei|imsi)([_-]|$)", re.I)
 PATH_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
@@ -45,7 +47,8 @@ def safe_url(value: str) -> str:
         host = "[" + hostname + "]" if ":" in hostname else hostname
         if parsed.port:
             host += ":" + str(parsed.port)
-        query = [(key, "<redacted>" if val else "") for key, val in parse_qsl(parsed.query, keep_blank_values=True)]
+        query = [(key, "<redacted>" if val else "") for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+                 if not sensitive_key(key) and not resource_signature_key(key)]
         return urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), ""))
     except ValueError:
         return "<invalid-url>"
@@ -113,30 +116,32 @@ def validate_mapping(profile: Any) -> dict[str, Any]:
         decode = rule["decode"]
         if not isinstance(decode, dict) or decode.get("type") not in ("json", "base64_json"):
             raise MCPError("Mapping decode.type must be json or explicitly confirmed base64_json.")
-        allowed = {"type"} if decode["type"] == "json" else {"type", "path", "confirmed", "success"}
+        allowed = {"type", "success"} if decode["type"] == "json" else {"type", "path", "confirmed", "success"}
         if set(decode) - allowed:
             raise MCPError("Decoder contains unrecognized options; secrets and headers are not supported.")
         if decode["type"] == "base64_json":
             if decode.get("confirmed") is not True:
                 raise MCPError("Base64 JSON decoding requires confirmed:true after inspecting a real response.")
             path_parts(decode.get("path"), False)
-            if "success" in decode:
-                success = decode["success"]
-                if not isinstance(success, dict) or set(success) != {"path", "equals"} or type(success["equals"]) not in (int, bool, type(None)):
-                    raise MCPError("Decoder success check supports a JSON path and integer, boolean, or null equality only.")
-                path_parts(success["path"], False)
+        if "success" in decode:
+            success = decode["success"]
+            if not isinstance(success, dict) or set(success) != {"path", "equals"} or type(success["equals"]) not in (str, int, bool, type(None)):
+                raise MCPError("Decoder success check requires a JSON path and a string, integer, boolean, or null equality.")
+            if isinstance(success["equals"], str) and (len(success["equals"]) > 128 or any(ord(c) < 32 for c in success["equals"])):
+                raise MCPError("Decoder success strings must be short observed business status values.")
+            path_parts(success["path"], False)
     return profile
 
 
 def decode_json(text: str, decoder: dict[str, Any]) -> Any:
     try:
         value = json.loads(text)
+        success = decoder.get("success")
+        if success:
+            actual = scalar_at(value, success["path"])
+            if type(actual) is not type(success["equals"]) or actual != success["equals"]:
+                raise MCPError("Captured envelope did not pass the confirmed success check.")
         if decoder["type"] == "base64_json":
-            success = decoder.get("success")
-            if success:
-                actual = scalar_at(value, success["path"])
-                if type(actual) is not type(success["equals"]) or actual != success["equals"]:
-                    raise MCPError("Captured envelope did not pass the confirmed success check.")
             encoded = scalar_at(value, decoder["path"])
             if not isinstance(encoded, str):
                 raise MCPError("Confirmed Base64 envelope path did not contain a string.")
@@ -150,9 +155,11 @@ def read_response(client: ProxyPinMCP, flow_id: str) -> tuple[str | None, dict[s
     """Read complete text with bounded byte slices, preserving Unicode boundaries."""
     chunks, offset, expected_total = [], 0, None
     meta: dict[str, Any] = {}
+    chunk_limit = body_chunk_limit(client)
     while True:
-        for adjustment in range(4):
-            part = client.call("get_flow_body", {"id": flow_id, "side": "response", "offset": offset, "limit": 65536 - adjustment})
+        for adjustment in range(min(4, chunk_limit)):
+            limit = chunk_limit - adjustment
+            part = client.call("get_flow_body", {"id": flow_id, "side": "response", "offset": offset, "limit": limit})
             if not isinstance(part, dict):
                 raise MCPError("get_flow_body returned invalid metadata.")
             if not part.get("available") or part.get("binary"):
@@ -162,7 +169,7 @@ def read_response(client: ProxyPinMCP, flow_id: str) -> tuple[str | None, dict[s
             returned, total, actual_offset = part.get("returned"), part.get("total"), part.get("offset")
             if any(type(number) is not int for number in (returned, total, actual_offset)):
                 raise MCPError("Captured body byte metadata is invalid.")
-            if total < 0 or total > client.max_body_bytes or returned < 0 or returned > 65536 - adjustment or actual_offset != offset or offset + returned > total:
+            if total < 0 or total > client.max_body_bytes or returned < 0 or returned > limit or actual_offset != offset or offset + returned > total:
                 raise MCPError("Captured body pagination is inconsistent or exceeds its size limit.")
             if expected_total is not None and total != expected_total:
                 raise MCPError("Captured body size changed during pagination.")
@@ -194,6 +201,8 @@ class CaptureExporter:
         self.unresolved: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] = []
         self._product_keys: set[tuple[Any, ...]] = set()
+        self._mapping_flow_ids: set[str] = set()
+        self.mapping_stats = {"matched_records": 0, "empty_arrays": 0}
         self.selection = {"listing_pages": 0, "stop_reason": None, "limit": None, "max_pages": None}
 
     @staticmethod
@@ -230,8 +239,14 @@ class CaptureExporter:
             return result
         selected, seen = [], set()
         page_size = min(limit, 100)
+        tools = getattr(self.client, "_tools", None)
+        if isinstance(tools, dict):
+            maximum = tools.get("list_flows", {}).get("inputSchema", {}).get("properties", {}).get("limit", {}).get("maximum")
+            if type(maximum) is int and maximum > 0:
+                page_size = min(page_size, maximum)
+        offset = 0
         for page in range(max_pages):
-            args: dict[str, Any] = {"limit": page_size, "offset": page * page_size}
+            args: dict[str, Any] = {"limit": page_size, "offset": offset}
             if host:
                 args["host"] = host
             if url:
@@ -262,9 +277,9 @@ class CaptureExporter:
             if not new_ids:
                 self.selection["stop_reason"] = "repeated_flow_ids"
                 break
-            if len(flows) < page_size:
-                self.selection["stop_reason"] = "short_page"
-                break
+            # Servers may cap a page below the requested limit. Advance by
+            # returned rows; only an empty/repeated page proves no progress.
+            offset += len(flows)
         else:
             self.selection["stop_reason"] = "max_pages_reached"
         return selected
@@ -276,11 +291,25 @@ class CaptureExporter:
         for rule in self.mapping["rules"]:
             if rule["match"]["host"].lower() != parsed.hostname or rule["match"]["path"] != parsed.path:
                 continue
+            self._mapping_flow_ids.add(flow["id"])
             data = decode_json(text, rule["decode"])
             records = values_at(data, rule["records"])
             if not records:
-                self.errors.append({"request_id": flow["id"], "reason": "mapping_records_path_missing_or_empty"})
+                current = [data]
+                empty_array = False
+                for part in path_parts(rule["records"]):
+                    if part == "*" and current and all(isinstance(item, list) for item in current) and all(not item for item in current):
+                        empty_array = True
+                        break
+                    current = [child for item in current for child in (item if part == "*" and isinstance(item, list) else [item[part]] if isinstance(item, dict) and part in item else [])]
+                    if not current:
+                        break
+                if empty_array:
+                    self.mapping_stats["empty_arrays"] += 1
+                else:
+                    self.errors.append({"request_id": flow["id"], "reason": "mapping_records_path_missing"})
                 continue
+            self.mapping_stats["matched_records"] += len(records)
             for record in records:
                 if not isinstance(record, dict):
                     raise MCPError("Mapped records must be JSON objects observed to represent products.")
@@ -325,6 +354,8 @@ class CaptureExporter:
                             self.products.append(row)
 
     def export(self, flows: list[dict[str, Any]]) -> None:
+        if not flows:
+            self.errors.append({"reason": "no_flows_selected"})
         for flow in flows:
             method = flow.get("method") if isinstance(flow.get("method"), str) else "UNKNOWN"
             path = urlsplit(flow["url"]).path or "/"
@@ -352,12 +383,16 @@ class CaptureExporter:
             except (MCPError, ValueError) as exc:
                 request["response_summary"] = {"format": "error", "reason": self.client.safe_text(exc)}
                 self.errors.append({"request_id": flow["id"], "reason": self.client.safe_text(exc)})
+        if self.mapping is not None and flows and not self._mapping_flow_ids:
+            self.errors.append({"reason": "mapping_did_not_match_selected_flows"})
 
     def write(self, output: Path) -> dict[str, Any]:
         output.mkdir(parents=True, exist_ok=True)
         report = {"generated_utc": datetime.now(timezone.utc).isoformat(), "run_complete": not self.errors,
                   "scope": "selected existing captured flows only", "coverage_is_all_app_requests": False,
                   "mapping_applied": self.mapping is not None, "selection": self.selection,
+                  "product_result_ready": self.mapping is not None and bool(self.products) and not self.errors,
+                  "mapping": {"matched_flows": len(self._mapping_flow_ids), **self.mapping_stats},
                   "counts": {"requests": len(self.requests), "products": len(self.products), "unresolved": len(self.unresolved),
                              "unique_product_urls": len({row["url"] for row in self.products}), "errors": len(self.errors), "mcp_rpc_calls": self.client.rpc_calls},
                   "notes": ["No business requests, images, headers, response values, or configuration changes are exported by default.",
