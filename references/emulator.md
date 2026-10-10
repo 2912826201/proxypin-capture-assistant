@@ -99,7 +99,7 @@ MCP/ADB 重启可能使转发或会话失效：重新核对实例、面板与映
 
 先验证路由、拦截范围与当前用户 CA。确因信任问题缺少所需正文时，才在**本任务新建的隔离 AVD**实施此分支。已授权准备测试模拟器时，由 agent 完成必要设置并说明影响，不为每个步骤重复请求确认；用户已有 AVD、真机或范围外设备不在该授权内。宿主要求本人确认时遵守并给具体提示。
 
-1. 从当前 ProxyPin 实例导出公有根证书，不使用 Skill 内置/历史 CA 或私钥。确认格式、有效期和 CA 属性，记录 DER SHA-256 指纹。重新生成 CA 或更换实例时重新导出。
+1. 从当前 ProxyPin 实例导出公有根证书，不使用 Skill 内置/历史 CA 或私钥。当前已核实版本的 UI 在 HTTPS Proxy 下有 Export Root Certificate，文件名为 `ProxyPinCA.crt`；按当前 UI 保存并读回公有证书，不选择私钥或 p12 导出。另一条已核实路线是在代理确实运行时，通过实际代理端口请求 `http://proxy.pin/ssl`，取得当前公有 CA；它不是 MCP 端口，不能把普通直连 `/ssl` 当同一路由。确认格式、有效期和 CA 属性，记录 DER SHA-256 指纹。重新生成 CA 或更换实例时重新导出。依据：[当前公有证书导出](https://github.com/wanghongenpin/proxypin/blob/v1.3.3/lib/ui/mobile/setting/ssl.dart)、[代理证书路由](https://github.com/wanghongenpin/proxypin/blob/v1.3.3/lib/network/handle/http_proxy_handle.dart)、[证书响应](https://github.com/wanghongenpin/proxypin/blob/v1.3.3/lib/network/util/proxy_helper.dart)。执行前仍核实本机版本与当前 UI。
 2. 目标网络栈决定信任目录。当前 Dart SDK 的 Android 实现仍读取 `/system/etc/security/cacerts`；Android 14+ Conscrypt 可能从 APEX 读取。目标 App 内嵌版本或自定义信任须实测，不能只按 API 版本统一选目录。App 兼容时可选择较简单、可 root 的受支持镜像，但不能强制降级 App 或绕过其最低要求。
 3. 先核对本次 AVD 身份与启动参数，再探测权限；不要仅凭镜像标签保证 root：
 
@@ -141,7 +141,7 @@ MCP/ADB 重启可能使转发或会话失效：重新核对实例、面板与映
 
 ## 恢复与清理
 
-先导出并验证结果，再停止本次 VPN、录制和 MCP，恢复本任务改变的 SSL/过滤等配置。UI 可控时由 agent 做；本人动作无法代办时主动提示，未确认就列为待恢复。仅检查/恢复当前目标实例，不影响其他 ProxyPin 会话。
+先导出并验证结果。已验证直接 API 脚本不再依赖模拟器时，停止本次 VPN、录制和 MCP，恢复本任务改变的 SSL/过滤等配置。App/MCP 采集脚本仍需要这些服务时，明确保留的任务状态、启动方法和运行依赖，不能关闭后宣称可直接运行；暂停后重启须重新验证设备、CA、VPN 和 MCP。UI 可控时由 agent 做；本人动作无法代办时主动提示，未确认就列为待恢复。仅检查/恢复当前目标实例，不影响其他 ProxyPin 会话。
 
 - 删除本任务记录的具体 ADB forward：`<adb> -s <serial> forward --remove tcp:<owned-host-port>`。不使用 `--remove-all` 或 `adb kill-server` 代替精确处理。
 - 停止模拟器前再次核对 AVD 名与 serial；使用该实例的 `emu kill` 或已记录且身份仍匹配的 PID，只停止本任务 AVD。

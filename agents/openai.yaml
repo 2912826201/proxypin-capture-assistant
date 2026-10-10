@@ -1,4 +1,4 @@
 interface:
   display_name: "ProxyPin 抓包助手"
-  short_description: "从空白电脑和手机安装抓包环境，尽量接管操作并交付 JSON 与下载脚本"
-  default_prompt: "请用 $proxypin-capture-assistant 配置这台电脑和手机的抓包环境，安装所需工具、ProxyPin 和我指定的 App；尽量由你接管，只有无法代办时提醒我，并完成分析与导出。"
+  short_description: "分析真实抓包并生成、实测批量采集脚本，按需准备环境，保存 JSON 并提供下载器"
+  default_prompt: "请用 $proxypin-capture-assistant 分析我指定目标的少量真实请求，选择可行方法，生成并实际运行批量采集脚本，将 JSON 保存到我的文件夹并提供图片下载器。按需准备工具、ProxyPin 和目标 App，尽量接管操作；需要本人登录时主动提醒我。"

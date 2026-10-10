@@ -21,3 +21,9 @@ private/
 capture-runs/
 sample/
 final/
+collector_config.json
+target_adapter.py
+checkpoint.json
+errors.json
+report.json
+*.har
