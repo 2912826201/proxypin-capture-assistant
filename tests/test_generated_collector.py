@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
@@ -13,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -90,6 +93,111 @@ def run(context):
 '''
 
 
+INDEPENDENT_SIGNING_ADAPTER = '''import hashlib
+import hmac
+import json
+import secrets
+import time
+
+def run(context):
+    secret = context.secret('COLLECTOR_SIGNING_TEST_KEY').encode('utf-8')
+    settings = context.config['adapter_config']
+    run_id = secrets.token_hex(12)
+    saved = None
+    for page in range(1, context.max_pages + 1):
+        timestamp = time.time_ns() // 1000000
+        if settings['mode'] == 'stale_signature' and page == 2:
+            timestamp -= 60000
+        unsigned = {'page': page, 'body': {'category': 'controlled-fixture', 'offset': (page - 1) * 20, 'run': run_id},
+                    'nonce': secrets.token_hex(16), 'time': timestamp}
+        signature = hmac.new(secret, json.dumps(unsigned, sort_keys=True, separators=(',', ':')).encode('utf-8'), hashlib.sha256).hexdigest()
+        if settings['mode'] == 'copied_signature' and saved is not None:
+            signature = saved
+        saved = signature
+        data = context.http_json(settings['endpoint'] + '/items', method='POST', body=dict(unsigned, signature=signature))
+        context.require_equal(data['code'], 0)
+        yield {'items': data['items'], 'state': {'page': page}}
+'''
+
+
+OFFLINE_CHILD_HARNESS = '''# Unit-test-only launcher: no invented factory live evidence.
+import importlib.util
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+root = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('controlled_runtime', root / 'collect_data.py')
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+config = json.loads((root / 'collector_config.json').read_text(encoding='utf-8'))
+assert config['verification']['status'] == 'offline_controlled_test_only'
+assert config['allowed_hosts'] == ['127.0.0.1']
+original_host_check = runtime.valid_host
+def only_test_loopback(host):
+    return host if host == '127.0.0.1' else original_host_check(host)
+# Exercise the actual runtime/adapter in an independent process, while keeping
+# both its historical evidence label and its HTTP destination explicitly local.
+# Production validation still rejects this config without these test patches.
+with patch.object(runtime, 'validate_config', return_value=config), patch.object(runtime, 'valid_host', side_effect=only_test_loopback):
+    raise SystemExit(runtime.main())
+'''
+
+
+class IndependentSigningServer(ThreadingHTTPServer):
+    """Real loopback HTTP verifier. This is not a target App/API algorithm."""
+    daemon_threads = True
+
+    def __init__(self):
+        self.test_secret = b"OFFLINE_TEST_SIGNING_KEY"
+        self.state_lock = threading.Lock()
+        self.accepted, self.rejected, self.seen_nonces = [], [], set()
+        super().__init__(("127.0.0.1", 0), IndependentSigningHandler)
+
+
+class IndependentSigningHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # No signature, secret, request body, or URL diagnostics in logs.
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if self.path != "/items" or not 1 <= length <= 1024 * 1024:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length))
+            unsigned = {key: value for key, value in payload.items() if key != "signature"}
+            expected = hmac.new(self.server.test_secret, json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(payload.get("signature", ""), expected):
+                reason = "invalid_signature"
+            elif type(payload.get("time")) is not int or abs(time.time_ns() // 1000000 - payload["time"]) > 10000:
+                reason = "stale_timestamp"
+            else:
+                reason = None
+            with self.server.state_lock:
+                if payload.get("nonce") in self.server.seen_nonces:
+                    reason = "reused_nonce"
+                if reason:
+                    self.server.rejected.append({"reason": reason, "payload": payload})
+                else:
+                    self.server.seen_nonces.add(payload["nonce"])
+                    self.server.accepted.append(payload)
+            if reason:
+                status, result = 403, {"error": "controlled_test_request_rejected"}
+            else:
+                identifier = payload["body"]["run"] + ":" + str(payload["page"])
+                product = row(identifier, "https://img.public.cn/" + identifier.replace(":", "-") + ".jpg")
+                product["source"] = "http://127.0.0.1:" + str(self.server.server_port) + "/items"
+                status, result = 200, {"code": 0, "items": [product]}
+        except (ValueError, TypeError, KeyError):
+            status, result = 400, {"error": "invalid_controlled_test_payload"}
+        raw = json.dumps(result).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
 class GeneratedCollectorTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="collector-offline-test-")
@@ -161,6 +269,96 @@ class GeneratedCollectorTests(unittest.TestCase):
         self.assertEqual(len(self.read("products.json")), 1)
         self.assertEqual(self.read("checkpoint.json")["state"], {"page": 1})
         self.assertEqual(self.read("report.json")["status"], "partial")
+
+    def test_bare_business_login_error_defaults_local_action_and_keeps_partial(self):
+        self.generate("def run(context):\n    yield {'items': [" + repr(row()) + "], 'state': {'page': 1}}\n    context.fail('login_required')\n")
+        status, _, stderr = self.collect()
+        self.assertEqual(status, 2)
+        self.assertIn("LOGIN_REQUIRED: Log in to the target App locally", stderr)
+        self.assertEqual(len(self.read("products.json")), 1)
+        self.assertEqual(self.read("checkpoint.json")["state"], {"page": 1})
+        self.assertEqual(self.read("report.json")["status"], "partial")
+        self.assertEqual(self.read("report.json")["user_action_required"], "Log in to the target App locally, then resume collection.")
+
+    def test_independent_process_signers_use_fresh_runtime_hmac_and_reject_replay(self):
+        server = IndependentSigningServer()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(close_server)
+        self.bundle.mkdir()
+        for name, source in (("collect_data.py", ROOT / "assets" / "collector_runtime.py"),
+                             ("proxypin_mcp.py", ROOT / "scripts" / "proxypin_mcp.py"),
+                             ("export_capture.py", ROOT / "scripts" / "export_capture.py")):
+            shutil.copyfile(source, self.bundle / name)
+        (self.bundle / "target_adapter.py").write_text(INDEPENDENT_SIGNING_ADAPTER, encoding="utf-8")
+        launcher = self.bundle / "offline_child.py"
+        launcher.write_text(OFFLINE_CHILD_HARNESS, encoding="utf-8")
+        config = fixture_config()
+        config.update(allowed_hosts=["127.0.0.1"], max_pages=2,
+                      verification={"status": "offline_controlled_test_only", "source": "loopback_hmac_verifier"})
+        endpoint = "http://127.0.0.1:" + str(server.server_port)
+        child_environment = os.environ.copy()
+        child_environment["COLLECTOR_SIGNING_TEST_KEY"] = "OFFLINE_TEST_SIGNING_KEY"
+
+        def run_child(label, mode):
+            config["adapter_config"] = {"endpoint": endpoint, "mode": mode}
+            (self.bundle / "collector_config.json").write_text(json.dumps(config), encoding="utf-8")
+            output = self.directory / label
+            process = subprocess.Popen([sys.executable, "-I", "-B", str(launcher), "--output-dir", str(output), "--max-pages", "2"],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                       cwd=self.inputs, env=child_environment)
+            try:
+                stdout, stderr = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                self.fail("Controlled child process timed out")
+            files = {name: json.loads((output / name).read_text(encoding="utf-8")) for name in factory.runtime.FILES}
+            self.assertEqual(files["report.json"]["source_evidence"]["status"], "offline_controlled_test_only")
+            content = stdout + stderr + "".join((output / name).read_text(encoding="utf-8") for name in factory.runtime.FILES)
+            self.assertNotIn("OFFLINE_TEST_SIGNING_KEY", content)
+            with server.state_lock:
+                signatures = [request["signature"] for request in server.accepted]
+                signatures += [entry["payload"]["signature"] for entry in server.rejected]
+            self.assertTrue(all(signature not in content for signature in signatures))
+            return process.pid, process.returncode, stdout, stderr, files
+
+        before = time.time_ns() // 1000000
+        first = run_child("fresh-process-one", "fresh")
+        second = run_child("fresh-process-two", "fresh")
+        after = time.time_ns() // 1000000
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual((first[1], second[1]), (0, 0), first[3] + second[3])
+        self.assertEqual([request["page"] for request in server.accepted], [1, 2, 1, 2])
+        self.assertEqual([request["body"]["offset"] for request in server.accepted], [0, 20, 0, 20])
+        self.assertEqual(len({request["nonce"] for request in server.accepted}), 4)
+        self.assertEqual(len({request["signature"] for request in server.accepted}), 4)
+        self.assertTrue(all(before <= request["time"] <= after for request in server.accepted))
+        first_ids = {item["id"] for item in first[4]["products.json"]}
+        second_ids = {item["id"] for item in second[4]["products.json"]}
+        self.assertEqual((len(first_ids), len(second_ids)), (2, 2))
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+
+        copied = run_child("copied-process", "copied_signature")
+        stale = run_child("stale-process", "stale_signature")
+        self.assertEqual((copied[1], stale[1]), (2, 2))
+        for result in (copied, stale):
+            self.assertEqual(len(result[4]["products.json"]), 1)
+            self.assertEqual(result[4]["report.json"]["status"], "partial")
+            self.assertEqual(result[4]["report.json"]["stop_reason"], "access_denied_or_signature_required")
+            self.assertNotIn("LOGIN_REQUIRED", result[3])
+        self.assertEqual([entry["reason"] for entry in server.rejected], ["invalid_signature", "stale_timestamp"])
+
+        # This whole path is deliberately test-only. A real generated collector
+        # still rejects its offline proof and reserved host outside the harness.
+        with self.assertRaises(factory.CollectorError):
+            factory.runtime.validate_config(config)
 
     def test_no_empty_success_and_exception_never_echoes_private_data(self):
         self.generate("def run(context):\n    raise RuntimeError('PRIVATE_TOKEN_RESPONSE')\n    yield\n")

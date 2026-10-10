@@ -167,6 +167,8 @@ class Context:
         self._opener = None
 
     def fail(self, code, user_action=None):
+        if code == "login_required" and user_action is None:
+            user_action = "Log in to the target App locally, then resume collection."
         raise CollectorError(code, user_action)
 
     def secret(self, environment_name, prompt="Local credential (never paste into chat): "):
