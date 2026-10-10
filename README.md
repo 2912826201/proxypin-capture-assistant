@@ -5,6 +5,7 @@
 ## 能做什么
 
 - 检查电脑与手机的现有环境，准备实际缺少的工具，安装官方 ProxyPin 和用户指定 App。
+- 新建 Android 自动化环境时优先验证任务专用模拟器；App 兼容后由助手准备、操作并抓包。需要真机现有会话、硬件或设备完整性时保留真机。
 - 尽量由助手操作手机、触发请求、配置抓包并分析；只有无法代办的操作才主动给出具体提示。
 - 按真实响应导出 JSON 数组。商品图片任务交付商品名称、图片 URL、返回的 ID 和来源等信息，以及可批量运行的 Python 下载脚本。
 - 默认收集 URL，不批量下载图片；下载脚本默认预览，显式启用后才下载。
@@ -49,17 +50,17 @@ python download_images.py products.json --download
 
 ## 环境与接管条件
 
-- Windows 附带 `scripts/bootstrap_windows.ps1`，其初始化过程不依赖预先安装 Python；默认仅检测，选择安装模式后才准备工具。
+- Windows 附带 `scripts/bootstrap_windows.ps1`，其初始化过程不依赖预先安装 Python；默认仅检测，选择安装模式后才准备工具。模拟器、Java、SDK 管理工具和 AVD 由助手按 [隔离模拟器路线](references/emulator.md) 另行准备，helper 本身不安装这些组件。
 - MCP、导出和图片下载脚本使用 Python 3.10+ 标准库，无需安装第三方 Python 包。
-- Android 接管需要已授权 ADB 或可用的手机控制工具。首次 USB 调试授权、解锁、登录等本人验证如无法代办，会主动提示用户。
+- Android 真机接管需要已授权 ADB 或可用的手机控制工具。专用模拟器由助手建立并通过 ADB 控制，不要求连接真实手机；实际需要的虚拟化设置、主机重启、解锁或本人登录如无法代办，会主动提示用户。
 - iPhone 是否可接管取决于当前可用工具与设备限制，不承诺仅凭 ProxyPin MCP 即可点击手机界面。
 - ProxyPin MCP 连通、VPN/代理生效和 HTTPS 正文可解密分别验证。不同 App 的证书信任机制会影响抓取，遇到失败按实际证据处理。
 
-详细步骤见 [空白环境初始化](references/bootstrap.md)、[设备接管](references/device-control.md) 和 [手动操作提示](references/manual-steps.md)。
+详细步骤见 [空白环境初始化](references/bootstrap.md)、[隔离模拟器路线](references/emulator.md)、[设备接管](references/device-control.md) 和 [手动操作提示](references/manual-steps.md)。系统 CA 用于解决必要的证书信任，不保证绕过登录、证书固定或设备完整性校验；每次重启分别复核 CA、VPN 和 MCP。
 
 ## 已验证范围
 
-MCP 客户端、分页导出、下载预览和 Windows 初始化逻辑已做离线测试与空白环境模拟。**真实空白电脑和手机的完整安装、接管与抓包流程尚未完成验证。** 本仓库作为接下来从零测试的 Skill 基线，结果覆盖范围按每次实际抓取报告。
+MCP 客户端、分页导出、下载预览和 Windows 初始化逻辑已做离线测试与空白环境模拟。历史实测中，一个 Android App 在特定模拟器、系统 CA 与 ProxyPin VPN 组合下完成了 HTTPS 抓包；这不代表其他 App 或镜像已验证。新增模拟器准备与恢复流程依据官方资料编写，并进行独立场景检查。**真实空白电脑和手机的完整安装、接管与抓包流程尚未完成验证。** 本仓库作为从零测试的 Skill 基线，结果覆盖范围按每次实际抓取报告。
 
 ## 文件结构
 
@@ -69,6 +70,7 @@ agents/openai.yaml
 references/
   bootstrap.md
   device-control.md
+  emulator.md
   manual-steps.md
   output-contract.md
   troubleshooting.md

@@ -6,6 +6,8 @@
 
 当前助手须已有可执行命令/操作设备的工具以及所需文件权限。Skill 能指导和运行准备工作，但不能凭空赋予宿主未提供的手机控制权限。先检测系统、CPU 架构、当前工具和设备，不假定空白电脑装了 Python、ADB、Android Studio、Git 或 Flutter。
 
+Android 在安装前按 [连接流程](workflow.md) 选真机或模拟器。采用模拟器时同时读 [隔离模拟器路线](emulator.md)：额外准备当前兼容的 SDK 管理工具、Java、模拟器和系统镜像，建立任务专用 AVD；不发真机接线/USB 授权提示。现有 Windows helper 负责 Platform-Tools、ProxyPin、目标 APK 与 Python，**不安装模拟器、完整 SDK 或 AVD**；额外组件由 agent 按该参考执行，不能把 helper 成功当成模拟器已就绪。
+
 记录 `setup-state.json`：每项组件的来源、版本、路径、状态、安装验证、待处理动作及恢复项目。状态区分 `missing / prepared / installed / verified / pending_user / blocked`；下载到文件不等于安装成功，安装成功不等于手机可控制或 MCP 可抓流量。不在报告中存密码、token、账号或设备内容。
 
 1. 查宿主自带运行时；有依赖发现工具时先用它。验证 Python 3.10+ 能导入 `ssl/json/urllib/concurrent.futures`。可复用时不重复安装或改全局 PATH。
@@ -50,7 +52,7 @@ agent 以相同“发现 → 官方下载 → 安装 → 验证”流程执行�
 Android 流程：
 
 1. agent 从官方发布页准备兼容的 ProxyPin APK；能确定手机 ABI 时选匹配构件，不确定时优先官方通用包。核对来源、上游可用的校验/签名，记录本地 SHA256；不能将自己算出的 hash 称为发布者签名验证。
-2. 首次连接没有手机控制能力时，主动指导最小动作：数据线连接、解锁、开启开发者选项/USB 调试并允许本电脑。agent 在等待时可完成下载和电脑工具准备；授权后立即接管。未授权 ADB 无法自己确认其 RSA 信任弹窗。
+2. 真机首次连接没有手机控制能力时，主动指导最小动作：数据线连接、解锁、开启开发者选项/USB 调试并允许本电脑。agent 在等待时可完成下载和电脑工具准备；授权后立即接管。未授权 ADB 无法自己确认其 RSA 信任弹窗。专用模拟器按其路线自动启动并验证实例身份，不需要用户在真实手机授权。
 3. 用已授权目标设备安装 APK；成功后检查 `pm path` / `dumpsys package` 的包名和版本，再启动并读屏。安装受 OEM 提示限制时先检查实际屏幕，能代办的确认由 agent 做；设备密码或不能操作的提示才请用户处理。
 4. 目标 App 未安装时，agent 查用户指定的官方站点/官方应用商店，核实应用身份、开发者、包名和兼容版本，再下载/安装。若来源或同名 App 身份无法确认，只问一次必要的来源信息，不猜 APK、不换成别的 App。商店可通过已授权 UI 操作时由 agent 完成；账号密码、二次验证或付费步骤按本人操作/授权处理。
 5. 拆分 APK 使用已确认的一整套官方构件和对应安装命令。签名冲突或降级失败时不得靠卸载 App、清空数据、关闭安全检查来“修复”。已有正常 App 直接复用，不自动覆盖用户版本。
@@ -63,6 +65,6 @@ agent 打开 ProxyPin，配置所选抓包路线、MCP 和必要证书，再按 
 
 Android 已授权 ADB 时可尝试 `adb -s <serial> forward tcp:0 tcp:<手机面板实际MCP端口>`，用返回本机端口连接手机 MCP；**仍要手机 Bearer token**，不能因地址变成 loopback 就按免 token 桌面实例处理。附带 MCP 客户端和导出器使用 `--require-token` 强制安全输入/环境凭据。这是基于官方 ADB forward 和手机 MCP 监听方式的可验证连接方案：必须实测初始化和工具调用；成功时不必为了 MCP 另要求同 Wi-Fi。失败再采用局域网等实际可用路径。
 
-完成后恢复本次代理/VPN/过滤设置，移除本次端口转发；保留用户以后需要的已安装工具和应用。临时 APK、截图、抓包正文与安装缓存按用户清理要求处理，不卸载正式工具或删除账号数据。
+完成后先导出结果，恢复本次代理/VPN/过滤设置，移除本次端口转发；保留用户以后需要的已安装工具和应用。模拟器按 [专用路线的恢复与清理](emulator.md#恢复与清理) 处理。临时 APK、截图、抓包正文与安装缓存按用户清理要求处理，不卸载正式工具或删除账号数据。
 
 官方来源：[ProxyPin 发布](https://github.com/wanghongenpin/proxypin/releases)、[MCP](https://github.com/wanghongenpin/proxypin/wiki/MCP%E6%9C%8D%E5%8A%A1)、[Android Platform-Tools](https://developer.android.com/tools/releases/platform-tools)、[ADB](https://developer.android.com/tools/adb)、[Python Windows](https://docs.python.org/3/using/windows.html)。发布资产与版本每次重新核实。
